@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	storagepb "cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"github.com/apache/arrow/go/v10/arrow"
 	"github.com/apache/arrow/go/v10/arrow/array"
 	"github.com/apache/arrow/go/v10/arrow/ipc"
@@ -16,7 +17,6 @@ import (
 	"github.com/goccy/go-json"
 	goavro "github.com/linkedin/goavro/v2"
 	bigqueryv2 "google.golang.org/api/bigquery/v2"
-	storagepb "google.golang.org/genproto/googleapis/cloud/bigquery/storage/v1"
 	"google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -409,7 +409,6 @@ func (s *storageWriteServer) CreateWriteStream(ctx context.Context, req *storage
 		TableSchema: schema,
 		WriteMode:   storagepb.WriteStream_INSERT,
 	}
-
 	s.mu.Lock()
 	s.streamMap[streamName] = &writeStreamStatus{
 		streamType:    streamType,
@@ -488,7 +487,10 @@ func (s *storageWriteServer) appendRows(req *storagepb.AppendRowsRequest, msgDes
 	if status.finalized {
 		return fmt.Errorf("stream is already finalized")
 	}
-	offset := req.GetOffset().Value
+	offset := int64(0)
+	if req.GetOffset() != nil {
+		offset = req.GetOffset().Value
+	}
 	rows := req.GetProtoRows().GetRows().GetSerializedRows()
 	data, err := s.decodeData(msgDesc, rows)
 	if err != nil {
@@ -514,10 +516,15 @@ func (s *storageWriteServer) appendRows(req *storagepb.AppendRowsRequest, msgDes
 			s.sendErrorMessage(stream, streamName, err)
 			return err
 		}
+		if err := tx.Commit(); err != nil {
+			s.sendErrorMessage(stream, streamName, err)
+			return err
+		}
 	} else {
 		status.rows = append(status.rows, data...)
 	}
 	return s.sendResult(stream, streamName, offset+int64(len(rows)))
+
 }
 
 func (s *storageWriteServer) sendResult(stream storagepb.BigQueryWrite_AppendRowsServer, streamName string, offset int64) error {
@@ -670,10 +677,14 @@ func (s *storageWriteServer) insertTableData(ctx context.Context, tx *connection
 
 func (s *storageWriteServer) GetWriteStream(ctx context.Context, req *storagepb.GetWriteStreamRequest) (*storagepb.WriteStream, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	status, exists := s.streamMap[req.Name]
+	s.mu.RUnlock()
 	if !exists {
-		return nil, fmt.Errorf("failed to find stream from %s", req.Name)
+		stream, err := s.createDefaultStream(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find stream from %s", req.Name)
+		}
+		return stream, err
 	}
 	return status.stream, nil
 }
@@ -766,6 +777,58 @@ func (s *storageWriteServer) FlushRows(ctx context.Context, req *storagepb.Flush
 	return &storagepb.FlushRowsResponse{
 		Offset: offset,
 	}, nil
+}
+
+/*
+*
+According to google documentation (https://pkg.go.dev/cloud.google.com/go/bigquery/storage/apiv1#BigQueryWriteClient.GetWriteStream)
+every table has a special stream named ‘_default’ to which data can be written. This stream doesn’t need to be created using CreateWriteStream
+
+Here we create the default stream and add it to map in case it not exists yet, the GetWriteStreamRequest given as second
+argument should have Name in this format: projects/<projectId>/datasets/<datasetId>/tables/<tableId>/streams/_default
+*/
+func (s *storageWriteServer) createDefaultStream(ctx context.Context, req *storagepb.GetWriteStreamRequest) (*storagepb.WriteStream, error) {
+	streamId := req.Name
+	suffix := "_default"
+	streams := "/streams/"
+	if !strings.HasSuffix(streamId, suffix) {
+		return nil, fmt.Errorf("unexpected stream id: %s, expected '%s' suffix", streamId, suffix)
+	}
+	index := strings.LastIndex(streamId, streams)
+	if index == -1 {
+		return nil, fmt.Errorf("unexpected stream id: %s, expected containg '%s'", streamId, streams)
+	}
+	streamPart := streamId[:index]
+	writeStreamReq := &storagepb.CreateWriteStreamRequest{
+		Parent: streamPart,
+		WriteStream: &storagepb.WriteStream{
+			Type: storagepb.WriteStream_COMMITTED,
+		},
+	}
+	stream, err := s.CreateWriteStream(ctx, writeStreamReq)
+	if err != nil {
+		return nil, err
+	}
+	projectID, datasetID, tableID, err := getIDsFromPath(streamPart)
+	if err != nil {
+		return nil, err
+	}
+	tableMetadata, err := getTableMetadata(ctx, s.server, projectID, datasetID, tableID)
+	if err != nil {
+		return nil, err
+	}
+	streamStatus := &writeStreamStatus{
+		streamType:    storagepb.WriteStream_COMMITTED,
+		stream:        stream,
+		projectID:     projectID,
+		datasetID:     datasetID,
+		tableID:       tableID,
+		tableMetadata: tableMetadata,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.streamMap[streamId] = streamStatus
+	return stream, nil
 }
 
 func getIDsFromPath(path string) (string, string, string, error) {

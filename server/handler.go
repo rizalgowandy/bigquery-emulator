@@ -21,8 +21,10 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/goccy/go-json"
+	"github.com/goccy/go-zetasqlite"
 	"go.uber.org/zap"
 	bigqueryv2 "google.golang.org/api/bigquery/v2"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
 	"github.com/goccy/bigquery-emulator/internal/connection"
@@ -30,7 +32,7 @@ import (
 	"github.com/goccy/bigquery-emulator/internal/metadata"
 	internaltypes "github.com/goccy/bigquery-emulator/internal/types"
 	"github.com/goccy/bigquery-emulator/types"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 )
 
 func errorResponse(ctx context.Context, w http.ResponseWriter, e *ServerError) {
@@ -51,8 +53,9 @@ func encodeResponse(ctx context.Context, w http.ResponseWriter, response interfa
 }
 
 const (
-	discoveryAPIEndpoint = "/discovery/v1/apis/bigquery/v2/rest"
-	uploadAPIEndpoint    = "/upload/bigquery/v2/projects/{projectId}/jobs"
+	discoveryAPIEndpoint    = "/discovery/v1/apis/bigquery/v2/rest"
+	newDiscoveryAPIEndpoint = "/$discovery/rest"
+	uploadAPIEndpoint       = "/upload/bigquery/v2/projects/{projectId}/jobs"
 )
 
 //go:embed resources/discovery.json
@@ -1060,6 +1063,7 @@ func (h *jobsInsertHandler) importFromGCS(ctx context.Context, r *jobsInsertRequ
 		opts = append(
 			opts,
 			option.WithEndpoint(fmt.Sprintf("%s/storage/v1/", host)),
+			storage.WithJSONReads(),
 			option.WithoutAuthentication(),
 		)
 	}
@@ -1072,19 +1076,51 @@ func (h *jobsInsertHandler) importFromGCS(ctx context.Context, r *jobsInsertRequ
 		if !strings.HasPrefix(uri, gcsURIPrefix) {
 			return nil, fmt.Errorf("load source uri must start with gs://")
 		}
-		uri = strings.TrimLeft(uri, gcsURIPrefix)
+		uri = strings.TrimPrefix(uri, gcsURIPrefix)
 		paths := strings.Split(uri, "/")
 		if len(paths) < 2 {
 			return nil, fmt.Errorf("unexpected gcs uri format %s", uri)
 		}
 		bucketName := paths[0]
 		objectPath := strings.Join(paths[1:], "/")
-		reader, err := client.Bucket(bucketName).Object(objectPath).NewReader(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get gcs object reader for %s: %w", uri, err)
-		}
-		if err := h.importFromGCSObject(ctx, r, reader); err != nil {
-			return nil, err
+		switch strings.Count(objectPath, "*") {
+		case 0:
+			reader, err := client.Bucket(bucketName).Object(objectPath).NewReader(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get gcs object reader for %s: %w", uri, err)
+			}
+			if err := h.importFromGCSObject(ctx, r, reader); err != nil {
+				return nil, err
+			}
+		case 1:
+			splitPath := strings.Split(objectPath, "*")
+			prefix := splitPath[0]
+			suffix := splitPath[1]
+			query := &storage.Query{
+				Prefix: prefix,
+			}
+			query.SetAttrSelection([]string{"Name"})
+			it := client.Bucket(bucketName).Objects(ctx, query)
+			for {
+				attrs, err := it.Next()
+				if err == iterator.Done {
+					break
+				}
+				if err != nil {
+					return nil, fmt.Errorf("failed to list gcs object for %s: %w", uri, err)
+				}
+				if strings.HasSuffix(attrs.Name, suffix) {
+					reader, err := client.Bucket(bucketName).Object(attrs.Name).NewReader(ctx)
+					if err != nil {
+						return nil, fmt.Errorf("failed to get gcs object reader for %s: %w", uri, err)
+					}
+					if err := h.importFromGCSObject(ctx, r, reader); err != nil {
+						return nil, err
+					}
+				}
+			}
+		default:
+			return nil, fmt.Errorf("the number of wildcards in gcs uri must be 0 or 1")
 		}
 	}
 	endTime := time.Now()
@@ -1197,7 +1233,7 @@ func (h *jobsInsertHandler) exportToGCS(ctx context.Context, r *jobsInsertReques
 		if !strings.HasPrefix(uri, gcsURIPrefix) {
 			return nil, fmt.Errorf("destination uri must start with gs://")
 		}
-		uri = strings.TrimLeft(uri, gcsURIPrefix)
+		uri = strings.TrimPrefix(uri, gcsURIPrefix)
 		paths := strings.Split(uri, "/")
 		if len(paths) < 2 {
 			return nil, fmt.Errorf("unexpected gcs uri format %s", uri)
@@ -1386,6 +1422,22 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 			if err != nil {
 				return nil, err
 			}
+			destinationDataset := r.project.Dataset(tableRef.DatasetId)
+			if destinationDataset == nil {
+				return nil, fmt.Errorf("failed to find destination dataset: %s", tableRef.DatasetId)
+			}
+			destinationTable := destinationDataset.Table(tableRef.TableId)
+			destinationTableExists := destinationTable != nil
+			if !destinationTableExists {
+				_, err := createTableMetadata(ctx, tx, r.server, r.project, destinationDataset, tableDef.ToBigqueryV2(r.project.ID, tableRef.DatasetId))
+				if err != nil {
+					return nil, fmt.Errorf("failed to create table: %w", err)
+				}
+				serverErr := r.server.contentRepo.CreateTable(ctx, tx, tableDef.ToBigqueryV2(r.project.ID, tableRef.DatasetId))
+				if serverErr != nil {
+					return nil, fmt.Errorf("failed to create table: %w", serverErr)
+				}
+			}
 			if err := r.server.contentRepo.AddTableData(ctx, tx, tableRef.ProjectId, tableRef.DatasetId, tableDef); err != nil {
 				return nil, fmt.Errorf("failed to add table data: %w", err)
 			}
@@ -1445,8 +1497,110 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("failed to commit job: %w", err)
 		}
+		if response != nil && response.ChangedCatalog.Changed() {
+			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
+				return nil, err
+			}
+		}
 	}
+
 	return job, nil
+}
+
+func syncCatalog(ctx context.Context, server *Server, cat *zetasqlite.ChangedCatalog) error {
+	for _, table := range cat.Table.Added {
+		if err := addTableMetadata(ctx, server, table); err != nil {
+			return err
+		}
+	}
+	for _, table := range cat.Table.Deleted {
+		if err := deleteTableMetadata(ctx, server, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addTableMetadata(ctx context.Context, server *Server, spec *zetasqlite.TableSpec) error {
+	if len(spec.NamePath) != 3 {
+		return fmt.Errorf("unexpected table name path: %v", spec.NamePath)
+	}
+	projectID := spec.NamePath[0]
+	datasetID := spec.NamePath[1]
+	tableID := spec.NamePath[2]
+	project, err := server.metaRepo.FindProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	dataset := project.Dataset(datasetID)
+	if dataset == nil {
+		return fmt.Errorf("dataset %s is not found", datasetID)
+	}
+	fields := make([]*bigqueryv2.TableFieldSchema, 0, len(spec.Columns))
+	for _, column := range spec.Columns {
+		zetasqlType, err := column.Type.ToZetaSQLType()
+		if err != nil {
+			return err
+		}
+		fields = append(fields, types.TableFieldSchemaFromZetaSQLType(column.Name, zetasqlType))
+	}
+	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackIfNotCommitted()
+	if _, err := createTableMetadata(ctx, tx, server, project, dataset, &bigqueryv2.Table{
+		TableReference: &bigqueryv2.TableReference{
+			ProjectId: projectID,
+			DatasetId: datasetID,
+			TableId:   tableID,
+		},
+		Schema: &bigqueryv2.TableSchema{Fields: fields},
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteTableMetadata(ctx context.Context, server *Server, spec *zetasqlite.TableSpec) error {
+	if len(spec.NamePath) != 3 {
+		return fmt.Errorf("unexpected table name path: %v", spec.NamePath)
+	}
+	projectID := spec.NamePath[0]
+	datasetID := spec.NamePath[1]
+	tableID := spec.NamePath[2]
+	project, err := server.metaRepo.FindProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	dataset := project.Dataset(datasetID)
+	if dataset == nil {
+		return fmt.Errorf("dataset %s is not found", datasetID)
+	}
+	table := dataset.Table(tableID)
+	conn, err := server.connMgr.Connection(ctx, projectID, datasetID)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackIfNotCommitted()
+	if err := table.Delete(ctx, tx.Tx()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (h *jobsInsertHandler) addQueryResultToDynamicDestinationTable(ctx context.Context, tx *connection.Tx, r *jobsInsertRequest, response *internaltypes.QueryResponse) error {
@@ -1536,11 +1690,16 @@ func (h *jobsQueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		errorResponse(ctx, w, errInvalid(err.Error()))
 		return
 	}
+	useInt64Timestamp := false
+	if options := req.FormatOptions; options != nil {
+		useInt64Timestamp = options.UseInt64Timestamp
+	}
+	useInt64Timestamp = useInt64Timestamp || isFormatOptionsUseInt64Timestamp(r)
 	res, err := h.Handle(ctx, &jobsQueryRequest{
 		server:            server,
 		project:           project,
 		queryRequest:      &req,
-		useInt64Timestamp: isFormatOptionsUseInt64Timestamp(r),
+		useInt64Timestamp: useInt64Timestamp,
 	})
 	if err != nil {
 		errorResponse(ctx, w, errJobInternalError(err.Error()))
@@ -1584,6 +1743,11 @@ func (h *jobsQueryHandler) Handle(ctx context.Context, r *jobsQueryRequest) (*in
 	if !r.queryRequest.DryRun {
 		if err := tx.Commit(); err != nil {
 			return nil, err
+		}
+		if response.ChangedCatalog.Changed() {
+			if err := syncCatalog(ctx, r.server, response.ChangedCatalog); err != nil {
+				return nil, err
+			}
 		}
 	}
 	jobID := r.queryRequest.RequestId
@@ -2200,10 +2364,11 @@ func (h *tabledataListHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	dataset := datasetFromContext(ctx)
 	table := tableFromContext(ctx)
 	res, err := h.Handle(ctx, &tabledataListRequest{
-		server:  server,
-		project: project,
-		dataset: dataset,
-		table:   table,
+		server:            server,
+		project:           project,
+		dataset:           dataset,
+		table:             table,
+		useInt64Timestamp: isFormatOptionsUseInt64Timestamp(r),
 	})
 	if err != nil {
 		errorResponse(ctx, w, errInternalError(err.Error()))
@@ -2213,10 +2378,11 @@ func (h *tabledataListHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 }
 
 type tabledataListRequest struct {
-	server  *Server
-	project *metadata.Project
-	dataset *metadata.Dataset
-	table   *metadata.Table
+	server            *Server
+	project           *metadata.Project
+	dataset           *metadata.Dataset
+	table             *metadata.Table
+	useInt64Timestamp bool
 }
 
 func (h *tabledataListHandler) Handle(ctx context.Context, r *tabledataListRequest) (*internaltypes.TableDataList, error) {
@@ -2240,8 +2406,9 @@ func (h *tabledataListHandler) Handle(ctx context.Context, r *tabledataListReque
 	if err != nil {
 		return nil, err
 	}
+
 	return &internaltypes.TableDataList{
-		Rows:      response.Rows,
+		Rows:      internaltypes.Format(response.Schema, response.Rows, r.useInt64Timestamp),
 		TotalRows: response.TotalRows,
 	}, nil
 }
@@ -2401,10 +2568,9 @@ const (
 	SnapshotTableType         TableType = "SNAPSHOT"
 )
 
-func (h *tablesInsertHandler) Handle(ctx context.Context, r *tablesInsertRequest) (*bigqueryv2.Table, *ServerError) {
-	table := r.table
+func createTableMetadata(ctx context.Context, tx *connection.Tx, server *Server, project *metadata.Project, dataset *metadata.Dataset, table *bigqueryv2.Table) (*bigqueryv2.Table, *ServerError) {
 	now := time.Now().Unix()
-	table.Id = fmt.Sprintf("%s:%s.%s", r.project.ID, r.dataset.ID, r.table.TableReference.TableId)
+	table.Id = fmt.Sprintf("%s:%s.%s", project.ID, dataset.ID, table.TableReference.TableId)
 	table.CreationTime = now
 	table.LastModifiedTime = uint64(now)
 	table.Type = string(DefaultTableType) // TODO: need to handle other table types
@@ -2414,10 +2580,10 @@ func (h *tablesInsertHandler) Handle(ctx context.Context, r *tablesInsertRequest
 	table.Kind = "bigquery#table"
 	table.SelfLink = fmt.Sprintf(
 		"http://%s/bigquery/v2/projects/%s/datasets/%s/tables/%s",
-		r.server.httpServer.Addr,
-		r.project.ID,
-		r.dataset.ID,
-		r.table.TableReference.TableId,
+		server.httpServer.Addr,
+		project.ID,
+		dataset.ID,
+		table.TableReference.TableId,
 	)
 	encodedTableData, err := json.Marshal(table)
 	if err != nil {
@@ -2427,7 +2593,26 @@ func (h *tablesInsertHandler) Handle(ctx context.Context, r *tablesInsertRequest
 	if err := json.Unmarshal(encodedTableData, &tableMetadata); err != nil {
 		return nil, errInternalError(err.Error())
 	}
+	if err := dataset.AddTable(
+		ctx,
+		tx.Tx(),
+		metadata.NewTable(
+			server.metaRepo,
+			project.ID,
+			dataset.ID,
+			table.TableReference.TableId,
+			tableMetadata,
+		),
+	); err != nil {
+		if errors.Is(err, metadata.ErrDuplicatedTable) {
+			return nil, errDuplicate(err.Error())
+		}
+		return nil, errInternalError(err.Error())
+	}
+	return table, nil
+}
 
+func (h *tablesInsertHandler) Handle(ctx context.Context, r *tablesInsertRequest) (*bigqueryv2.Table, *ServerError) {
 	conn, err := r.server.connMgr.Connection(ctx, r.project.ID, r.dataset.ID)
 	if err != nil {
 		return nil, errInternalError(err.Error())
@@ -2437,21 +2622,10 @@ func (h *tablesInsertHandler) Handle(ctx context.Context, r *tablesInsertRequest
 		return nil, errInternalError(err.Error())
 	}
 	defer tx.RollbackIfNotCommitted()
-	if err := r.dataset.AddTable(
-		ctx,
-		tx.Tx(),
-		metadata.NewTable(
-			r.server.metaRepo,
-			r.project.ID,
-			r.dataset.ID,
-			r.table.TableReference.TableId,
-			tableMetadata,
-		),
-	); err != nil {
-		if errors.Is(err, metadata.ErrDuplicatedTable) {
-			return nil, errDuplicate(err.Error())
-		}
-		return nil, errInternalError(err.Error())
+
+	table, serverErr := createTableMetadata(ctx, tx, r.server, r.project, r.dataset, r.table)
+	if serverErr != nil {
+		return nil, serverErr
 	}
 	if r.table.Schema != nil {
 		if err := r.server.contentRepo.CreateTable(ctx, tx, r.table); err != nil {

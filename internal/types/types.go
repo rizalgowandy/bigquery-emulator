@@ -21,12 +21,13 @@ type (
 	}
 
 	QueryResponse struct {
-		JobReference *bigqueryv2.JobReference `json:"jobReference"`
-		Schema       *bigqueryv2.TableSchema  `json:"schema"`
-		Rows         []*TableRow              `json:"rows"`
-		TotalRows    uint64                   `json:"totalRows,string"`
-		JobComplete  bool                     `json:"jobComplete"`
-		TotalBytes   int64                    `json:"-"`
+		JobReference   *bigqueryv2.JobReference   `json:"jobReference"`
+		Schema         *bigqueryv2.TableSchema    `json:"schema"`
+		Rows           []*TableRow                `json:"rows"`
+		TotalRows      uint64                     `json:"totalRows,string"`
+		JobComplete    bool                       `json:"jobComplete"`
+		TotalBytes     int64                      `json:"-"`
+		ChangedCatalog *zetasqlite.ChangedCatalog `json:"-"`
 	}
 
 	TableDataList struct {
@@ -191,7 +192,7 @@ func Format(schema *bigqueryv2.TableSchema, rows []*TableRow, useInt64Timestamp 
 	for _, row := range rows {
 		cells := make([]*TableCell, 0, len(row.F))
 		for colIdx, cell := range row.F {
-			if schema.Fields[colIdx].Type == "TIMESTAMP" {
+			if schema.Fields[colIdx].Type == "TIMESTAMP" && cell.V != nil {
 				t, _ := zetasqlite.TimeFromTimestampValue(cell.V.(string))
 				microsec := t.UnixNano() / int64(time.Microsecond)
 				cells = append(cells, &TableCell{
